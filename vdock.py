@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import hashlib
 import json
 import logging
 import os
@@ -38,7 +39,7 @@ import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1-safety"
 log = logging.getLogger("vdock")
 
 
@@ -228,6 +229,35 @@ def cmd_box(a):
     else:
         if a.ligand:
             xyz = _coords_from_file(Path(a.ligand))
+            if a.structure:
+                # A crystal-instance ligand must be spatially aligned with the receptor.
+                # This catches CCD/ideal ligand SDFs, which are often near (0,0,0).
+                import gemmi
+                import numpy as np
+                from scipy.spatial import cKDTree
+                st = gemmi.read_structure(str(a.structure))
+                protein_xyz = []
+                for ch in st[0]:
+                    for residue in ch:
+                        if not gemmi.find_tabulated_residue(residue.name).is_amino_acid():
+                            continue
+                        for atom in residue:
+                            if atom.element.name not in ("H", "D"):
+                                protein_xyz.append((atom.pos.x, atom.pos.y, atom.pos.z))
+                if not protein_xyz:
+                    raise ValueError(f"No protein heavy atoms found in {a.structure}")
+                shortest = float(cKDTree(np.asarray(protein_xyz)).query(np.asarray(xyz))[0].min())
+                if shortest > 8.0:
+                    raise ValueError(
+                        f"COORDINATE-FRAME ERROR: reference ligand is {shortest:.1f} Å from "
+                        f"the nearest protein atom in {a.structure}. Do not use an ideal/CCD SDF; "
+                        "download the crystal INSTANCE coordinates or choose the co-crystal "
+                        "ligand box created by `vdock sites`."
+                    )
+                log.info("Ligand/protein coordinate check OK: nearest distance %.2f Å", shortest)
+            else:
+                log.warning("No --structure was provided: cannot verify that the ligand SDF is "
+                            "in the receptor crystal coordinate frame. Ideal/CCD SDFs are unsafe for boxes.")
         elif a.residues and a.structure:
             xyz = _coords_from_residues(Path(a.structure), a.residues)
         else:
@@ -412,6 +442,33 @@ def parse_vina_out(pdbqt: Path) -> list[float]:
     return [float(m.group(1)) for m in _RESULT_RE.finditer(pdbqt.read_text())]
 
 
+def _sha256(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for piece in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(piece)
+    return h.hexdigest()
+
+
+def _dock_signature(a, ligs: list[Path], vina_path: str) -> dict:
+    # Reuse is only safe when molecular inputs and calculation settings match.
+    return {
+        "format": 1,
+        "vina_executable": str(Path(vina_path).resolve()),
+        "vina_version": run([vina_path, "--version"], check=False).stdout.strip(),
+        "receptor_sha256": _sha256(a.receptor) if a.receptor else None,
+        "box_sha256": _sha256(a.box) if a.box else None,
+        "flex_sha256": _sha256(a.flex) if a.flex else None,
+        "maps": a.maps,
+        "scoring": a.scoring,
+        "exhaustiveness": a.exhaustiveness,
+        "num_modes": a.num_modes,
+        "energy_range": a.energy_range,
+        "seed": a.seed,
+        "ligands": {p.name: _sha256(p) for p in ligs},
+    }
+
+
 def _dock_one(job: dict) -> dict:
     lig = Path(job["ligand"])
     name = lig.stem
@@ -421,7 +478,9 @@ def _dock_one(job: dict) -> dict:
     log_file = out_dir / "logs" / f"{name}.log"
     if out_pdbqt.exists() and not job["overwrite"]:
         sc = parse_vina_out(out_pdbqt)
-        return {"ligand": name, "status": "skipped (exists)", "best": sc[0] if sc else None, "n_poses": len(sc)}
+        if sc and out_sdf.exists() and out_sdf.stat().st_size > 0:
+            return {"ligand": name, "status": "skipped (verified files)", "best": sc[0], "n_poses": len(sc)}
+        log.warning("Incomplete previous output for %s: re-docking", name)
 
     cmd = [job["vina"], "--ligand", lig,"--out", out_pdbqt, "--scoring", job["scoring"],
            "--exhaustiveness", job["exhaustiveness"], "--num_modes", job["num_modes"],
@@ -438,8 +497,11 @@ def _dock_one(job: dict) -> dict:
         sc = parse_vina_out(out_pdbqt)
         # Export with correct bond orders (uses the SMILES Meeko stored in the PDBQT)
         exp = subprocess.run(job["mk_export"] + [str(out_pdbqt), "-s", str(out_sdf)], capture_output=True, text=True)
-        status = "ok" if exp.returncode == 0 else "ok (sdf export failed)"
-        return {"ligand": name, "status": status, "best": sc[0] if sc else None, "n_poses": len(sc)}
+        if not sc:
+            raise RuntimeError("Vina finished without parseable scores")
+        if exp.returncode or not out_sdf.exists() or out_sdf.stat().st_size == 0:
+            raise RuntimeError("SDF export failed: " + exp.stderr[-300:].strip())
+        return {"ligand": name, "status": "ok", "best": sc[0], "n_poses": len(sc)}
     except Exception as e:
         return {"ligand": name, "status": f"FAILED: {str(e).splitlines()[0][:150]}", "best": None, "n_poses": 0}
 
@@ -461,10 +523,41 @@ def cmd_dock(a):
             sys.exit(f"ERROR: {label} file not found: {f}  (did the previous step finish without errors?)")
     if a.maps and not Path(f"{a.maps}.maps.fld").is_file():
         sys.exit(f"ERROR: AD4 maps not found: {a.maps}.maps.fld  (run prep-receptor --ad4)")
+    if a.scoring != "ad4":
+        import numpy as np
+        center, size = read_box(Path(a.box))
+        receptor_xyz = np.asarray(_coords_from_file(Path(a.receptor)), dtype=float)
+        if receptor_xyz.size == 0:
+            sys.exit("ERROR: receptor PDBQT contains no recognizable atom coordinates")
+        # Distance to nearest point on the bounding box, not just its center.
+        gap = np.maximum(np.abs(receptor_xyz - np.asarray(center)) - np.asarray(size) / 2, 0)
+        closest = float(np.sqrt((gap * gap).sum(axis=1)).min())
+        if closest > 8.0:
+            sys.exit(f"ERROR: docking box is {closest:.1f} Å away from the closest receptor atom. "
+                     "Possible ideal-ligand/wrong-coordinate-frame box. "
+                     "Compare box.txt with the 'sites' crystal-ligand box.")
+        log.info("Receptor/box spatial check OK (closest atom %.2f Å from box)", closest)
 
     outdir = Path(a.outdir)
+    signature_path = outdir / "run_signature.json"
+    signature = _dock_signature(a, ligs, vina_path)
+    previous_poses = (outdir / "poses").exists() and any((outdir / "poses").glob("*_out.pdbqt"))
+    if previous_poses:
+        if not signature_path.is_file():
+            sys.exit("ERROR: existing poses lack run_signature.json. Use a NEW --outdir "
+                     "to avoid mixing different receptors/boxes/settings.")
+        try:
+            prior = json.loads(signature_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            sys.exit(f"ERROR: cannot read existing docking signature: {exc}")
+        if prior != signature:
+            sys.exit("ERROR: receptor, box, ligand inputs, Vina version, or docking settings "
+                     "changed since this output folder was created. Use a NEW --outdir. "
+                     "--overwrite cannot safely remove outputs for ligands absent from the new input.")
     (outdir / "poses").mkdir(parents=True, exist_ok=True)
     (outdir / "logs").mkdir(parents=True, exist_ok=True)
+    # Signature is recorded BEFORE dispatching jobs; interrupted runs can safely resume.
+    signature_path.write_text(json.dumps(signature, indent=2), encoding="utf-8")
 
     ncores = os.cpu_count() or 1
     cpu = a.cpu_per_job or min(ncores, max(1, a.exhaustiveness))
@@ -485,6 +578,15 @@ def cmd_dock(a):
     n_fail = sum(r["status"].startswith("FAILED") for r in results)
     write_manifest(outdir / "manifest.json", "dock", {**vars(a), "cpu_per_job_used": cpu, "jobs_used": jobs})
     log.info("Done: %d docked, %d failed. Next: vdock summarize --dockdir %s", len(results) - n_fail, n_fail, outdir)
+    if n_fail:
+        failures_file = outdir / "docking_failures.tsv"
+        with failures_file.open("w", encoding="utf-8") as f:
+            f.write("ligand\tstatus\n")
+            for r in sorted(results, key=lambda r: r["ligand"]):
+                if r["status"].startswith("FAILED"):
+                    f.write(f"{r['ligand']}\t{r['status']}\n")
+        log.error("DOCKING INCOMPLETE: %d failed. See %s", n_fail, failures_file)
+        return 1
 
 
 # ----------------------------------------------------------------------------- summarize
@@ -520,6 +622,48 @@ def _rmsd_to_ref(pose_sdf: Path, ref: Path) -> float | None:
         return None
 
 
+
+
+def _all_pose_rmsds_to_ref(pose_sdf: Path, ref: Path) -> list[float]:
+    """Per-pose in-frame heavy-atom RMSDs, symmetry-aware, no superposition."""
+    import numpy as np
+    from rdkit import Chem
+
+    def skeleton(m):
+        rw = Chem.RWMol(Chem.RemoveHs(m, sanitize=False))
+        for at in rw.GetAtoms():
+            at.SetFormalCharge(0)
+            at.SetIsAromatic(False)
+            at.SetNoImplicit(True)
+            at.SetNumExplicitHs(0)
+        for b in rw.GetBonds():
+            b.SetBondType(Chem.BondType.SINGLE)
+            b.SetIsAromatic(False)
+        return rw.GetMol()
+
+    if ref.suffix.lower() in (".sdf", ".mol"):
+        refmol = Chem.MolFromMolFile(str(ref), removeHs=False)
+    else:
+        refmol = Chem.MolFromPDBFile(str(ref), removeHs=False)
+    if refmol is None:
+        raise ValueError(f"Could not parse reference ligand: {ref}")
+    rs = skeleton(refmol)
+    rx = rs.GetConformer().GetPositions()
+    values = []
+    for pose in Chem.SDMolSupplier(str(pose_sdf), removeHs=False):
+        if pose is None:
+            raise ValueError(f"Unparseable docking pose in {pose_sdf}")
+        ps = skeleton(pose)
+        if ps.GetNumAtoms() != rs.GetNumAtoms():
+            raise ValueError("Reference and docked pose have different heavy-atom counts")
+        px = ps.GetConformer().GetPositions()
+        matches = ps.GetSubstructMatches(rs, uniquify=False, useChirality=False, maxMatches=10000)
+        if not matches:
+            raise ValueError("No valid heavy-atom graph mapping for crystal pose")
+        values.append(float(min(np.sqrt(((px[list(mt)] - rx) ** 2).sum(1).mean()) for mt in matches)))
+    return values
+
+
 def cmd_summarize(a):
     from rdkit import Chem
     d = Path(a.dockdir)
@@ -539,8 +683,15 @@ def cmd_summarize(a):
                 row["heavy_atoms"] = m.GetNumHeavyAtoms()
                 row["ligand_efficiency"] = round(-sc[0] / max(1, m.GetNumHeavyAtoms()), 3)
             if a.reference:
-                r = _rmsd_to_ref(sdf, Path(a.reference))
-                row["rmsd_top_pose_A"] = round(r, 3) if r is not None else None
+                try:
+                    all_rmsds = _all_pose_rmsds_to_ref(sdf, Path(a.reference))
+                    if not all_rmsds:
+                        raise ValueError("No valid SDF poses")
+                    row["rmsd_top_pose_A"] = round(all_rmsds[0], 3)
+                    row["rmsd_best_saved_pose_A"] = round(min(all_rmsds), 3)
+                    row["best_rmsd_pose_rank"] = 1 + min(range(len(all_rmsds)), key=all_rmsds.__getitem__)
+                except (ValueError, OSError, StopIteration) as exc:
+                    log.warning("RMSD unavailable for %s: %s", name, exc)
         rows.append(row)
     if not rows:
         sys.exit(f"No results in {d/'poses'}")
@@ -556,7 +707,8 @@ def cmd_summarize(a):
     for i, r in enumerate(rows, 1):
         r["rank"] = i
     cols = ["rank", "parent", "ligand", "best_score_kcal_mol", "score_pose2", "n_poses", "heavy_atoms",
-            "ligand_efficiency", "rmsd_top_pose_A", "smiles"]
+            "ligand_efficiency", "rmsd_top_pose_A", "rmsd_best_saved_pose_A",
+            "best_rmsd_pose_rank", "smiles"]
     cols = [c for c in cols if any(c in r for r in rows)]
     out_csv = Path(a.out or d / "results.csv")
     with open(out_csv, "w", newline="") as fh:
@@ -576,7 +728,7 @@ def cmd_validate(a):
     work.mkdir(parents=True, exist_ok=True)
     ns = argparse.Namespace
     box = work / "box.txt"
-    cmd_box(ns(center=None, size=None, ligand=a.ligand, residues=None, structure=None,
+    cmd_box(ns(center=None, size=None, ligand=a.ligand, residues=None, structure=a.receptor,
                padding=a.padding, min_size=a.min_box, out=str(box)))
     cmd_prep_receptor(ns(input=a.receptor, outdir=str(work / "receptor"), name="receptor", chains=a.chains,
                          ph=a.ph, keep_water=False, fill_gaps=False, skip_fix=a.skip_fix, delete_residues=None,
@@ -589,9 +741,20 @@ def cmd_validate(a):
                 seed=a.seed, cpu_per_job=None, jobs=1, overwrite=True, outdir=str(work / "docking")))
     cmd_summarize(ns(dockdir=str(work / "docking"), reference=a.ligand, collapse_states=False, out=None, top=5))
     res = list(csv.DictReader(open(work / "docking" / "results.csv")))
-    rmsd = min(float(r["rmsd_top_pose_A"]) for r in res if r.get("rmsd_top_pose_A"))
-    verdict = "PASS" if rmsd <= 2.0 else "FAIL"
-    print(f"\nVALIDATION {verdict}: top-pose RMSD to crystal = {rmsd:.2f} Å (criterion ≤ 2.0 Å)")
+    valid = [r for r in res if r.get("rmsd_top_pose_A") and r.get("best_score_kcal_mol")]
+    if not valid:
+        print("\nVALIDATION INCOMPLETE: no calculable crystal RMSD for the docked ligand")
+        return 1
+    # Select the globally BEST-SCORED state/pose. Do not cherry-pick the smallest RMSD.
+    top = min(valid, key=lambda r: float(r["best_score_kcal_mol"]))
+    top_rmsd = float(top["rmsd_top_pose_A"])
+    best_saved = min(float(r.get("rmsd_best_saved_pose_A") or float("inf")) for r in valid)
+    verdict = "PASS" if top_rmsd <= 2.0 else "FAIL"
+    print(f"\nVALIDATION {verdict}: globally top-scoring pose RMSD = {top_rmsd:.3f} Å (≤ 2.0 Å)")
+    print(f"BEST-OF-SAVED-POSES RMSD = {best_saved:.3f} Å (different metric)")
+    if top_rmsd > 2.0 and best_saved <= 2.0:
+        print("POSE RECOVERY SUCCEEDED AMONG SAVED POSES, BUT TOP-1 RANKING FAILED.")
+        print("Do NOT rerank screening compounds by crystal RMSD; unknown compounds have no crystal reference.")
     return 0 if verdict == "PASS" else 1
 
 
@@ -611,7 +774,7 @@ def main(argv=None):
 
     s = sub.add_parser("box", help="define the docking search box")
     s.add_argument("--ligand", help="reference ligand (sdf/mol/mol2/pdb/pdbqt): box envelops it")
-    s.add_argument("--structure", help="PDB/mmCIF used with --residues")
+    s.add_argument("--structure", help="PDB/mmCIF used with --residues; with --ligand, checks matching coordinate frame")
     s.add_argument("--residues", help="binding-site residues, e.g. 'A:315,318,381'")
     s.add_argument("--center", type=float, nargs=3, metavar=("X", "Y", "Z"))
     s.add_argument("--size", type=float, nargs=3, metavar=("SX", "SY", "SZ"))
