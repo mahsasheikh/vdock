@@ -1,0 +1,24 @@
+# Native Windows (win-64) variant. conda-forge has no Windows build of Vina, so
+# install.ps1 downloads the official vina_1.2.7_win.exe from the Vina GitHub release
+# into ..\bin\. AutoGrid (AD4 scoring) has no Windows build: use vina/vinardo scoring.
+name: vina
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - rdkit
+  - gemmi
+  - scipy
+  - numpy
+  - pandas
+  - tqdm
+  - rich
+  - joblib
+  - pdbfixer
+  - openmm
+  - prolif=2.2          # protein-ligand interaction fingerprints
+  - mdanalysis
+  - pip
+  - pip:
+      - meeko==0.8.0
+      - molscrub==0.3.2

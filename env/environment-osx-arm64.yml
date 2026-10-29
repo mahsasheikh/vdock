@@ -1,0 +1,27 @@
+# Apple Silicon (osx-arm64) variant.
+# ProDy is not built for osx-arm64 on conda-forge, so the conda "meeko" package
+# cannot be solved there. Meeko is installed from PyPI instead; vdock feeds Meeko
+# a cleaned PDB through its RDKit reader, so ProDy is not needed.
+name: vina
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - vina=1.2.7
+  - rdkit
+  - gemmi
+  - scipy
+  - numpy
+  - pandas
+  - tqdm
+  - rich
+  - joblib
+  - pdbfixer
+  - openmm
+  - autogrid
+  - prolif=2.2          # protein-ligand interaction fingerprints
+  - mdanalysis
+  - pip
+  - pip:
+      - meeko==0.8.0
+      - molscrub==0.3.2

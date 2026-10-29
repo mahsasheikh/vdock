@@ -1,0 +1,6 @@
+rank,ligand,best_score_kcal_mol,score_pose2,n_poses,heavy_atoms,ligand_efficiency,rmsd_top_pose_A,smiles
+1,imatinib,-12.916,-11.336,4,37,0.349,0.473,Cc1ccc(NC(=O)c2ccc(C[N@H+]3CC[N@H+](C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1
+2,ponatinib,-11.865,-11.484,4,39,0.304,,Cc1ccc(C(=O)Nc2ccc(C[N@H+]3CC[N@H+](C)CC3)c(C(F)(F)F)c2)cc1C#Cc1cnc2cccnn12
+3,dasatinib,-9.144,-9.091,9,33,0.277,,Cc1nc(Nc2ncc(C(=O)Nc3c(C)cccc3Cl)s2)cc(N2CC[NH+](CCO)CC2)n1
+4,ibuprofen,-8.836,-8.241,8,15,0.589,,CC(C)Cc1ccc([C@@H](C)C(=O)[O-])cc1
+5,aspirin,-6.991,-6.948,9,13,0.538,,CC(=O)Oc1ccccc1C(=O)[O-]

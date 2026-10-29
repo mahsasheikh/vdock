@@ -1,0 +1,27 @@
+# AutoDock Vina docking environment (PaccanaroLab-FGV)
+# Versions follow the current upstream recommendations (Oct 2026):
+#   Vina 1.2.7 + Meeko 0.8 (receptor/ligand prep, export) + molscrub (ligand protonation/3D)
+name: vina
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - vina=1.2.7          # CLI + Python bindings
+  - meeko=0.8           # mk_prepare_receptor.py / mk_prepare_ligand.py / mk_export.py
+  - rdkit
+  - gemmi
+  - prody               # mmCIF/PDB reading in Meeko
+  - scipy
+  - numpy
+  - pandas
+  - tqdm
+  - rich
+  - joblib
+  - pdbfixer            # optional: fill missing atoms/residues before prep
+  - openmm
+  - autogrid            # autogrid4 for optional AD4 scoring
+  - prolif=2.2          # protein-ligand interaction fingerprints
+  - mdanalysis
+  - pip
+  - pip:
+      - molscrub==0.3.2  # scrub.py (protonation / tautomers / 3D)
