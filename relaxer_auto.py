@@ -549,13 +549,12 @@ class CrossConnectivity:
     intra-residue cutoff. Compare atom by atom against OpenMM topology."""
 
     def __init__(self, residues, clean, topo_bonds, Chem, np,
-                 detector, covalent_radius):
+                 detector):
         self.residues = {r.key: r for r in residues}
         self.clean = clean
         self.Chem = Chem
         self.np = np
         self.detector = detector
-        self.radii = covalent_radius
         self.expected = {pair(i, j) for i, j in topo_bonds
                          if clean[i].key != clean[j].key}
         self.molecules = {}
@@ -566,17 +565,57 @@ class CrossConnectivity:
             rw = Chem.RWMol()
             for i, atom in r.selected:
                 a = Chem.Atom("H" if atom.element == "D" else atom.element.capitalize())
-                if a.GetAtomicNum() not in covalent_radius:
-                    raise ValueError(f"Meeko has no covalent radius for {atom.element}.")
                 self.atom_numbers[i] = a.GetAtomicNum()
                 rw.AddAtom(a)
             mol = rw.GetMol()
             mol.AddConformer(Chem.Conformer(len(r.ids)))
             self.molecules[key] = (mol, r.atoms[0].residue)
             self.keymap[key] = r
-        # Source uses 1.2 * sum of covalent radii. A generous search buffer
-        # includes every residue potentially linked to a selected group.
-        self.buffer = 2.0 * max(covalent_radius.values()) + 4.0
+        # Query the installed Meeko detector itself for its effective pair
+        # cutoffs. Meeko has changed the location/representation of its
+        # covalent radii; importing a private constant is not portable.
+        elements = sorted(set(self.atom_numbers.values()))
+        self.cutoffs = {}
+        for x, z1 in enumerate(elements):
+            for z2 in elements[x:]:
+                self.cutoffs[z1, z2] = self.probe_cutoff(z1, z2)
+        self.buffer = max(self.cutoffs.values(), default=0.0) + 1.0
+        say("Calibrated inter-residue distance cutoffs using the installed Meeko.")
+
+    def probe_cutoff(self, z1, z2):
+        """Measure the installed bond detector's cutoff (angstroms).
+        On a pair of isolated atoms from separate residues, use a binary
+        search over their separation. No private radii table is imported.
+        """
+        Chem = self.Chem
+        molecules = []
+        for z in (z1, z2):
+            rw = Chem.RWMol()
+            rw.AddAtom(Chem.Atom(z))
+            mol = rw.GetMol()
+            conf = Chem.Conformer(1)
+            conf.Set3D(True)
+            conf.SetAtomPosition(0, (0.0, 0.0, 0.0))
+            mol.AddConformer(conf)
+            molecules.append(mol)
+        mols = {"A:1": (molecules[0], "UNK"), "A:2": (molecules[1], "UNK")}
+
+        def bonded(distance):
+            molecules[1].GetConformer().SetAtomPosition(0, (float(distance), 0., 0.))
+            return any(bool(pairs) for pairs in self.detector(mols).values())
+
+        low, high = 0.01, 8.0
+        if not bonded(low):
+            return 0.0  # This element pair is not considered bondable.
+        if bonded(high):
+            raise ValueError("Unexpected Meeko inter-residue cutoff >= 8 angstroms.")
+        for _ in range(18):
+            mid = (low + high) / 2
+            if bonded(mid):
+                low = mid
+            else:
+                high = mid
+        return high  # Conservative upper bound, accurate to ~0.00003 A.
 
     def scan(self, xyz, active=None):
         """Return inferred extra and missing inter-residue atom pairs.
@@ -618,7 +657,7 @@ class CrossConnectivity:
         return inferred - expected, expected - inferred
 
     def threshold(self, i, j):
-        return 1.2 * (self.radii[self.atom_numbers[i]] + self.radii[self.atom_numbers[j]])
+        return self.cutoffs[pair(self.atom_numbers[i], self.atom_numbers[j])]
 
     def show(self, title, issues, xyz):
         extra, missing = issues
@@ -632,7 +671,7 @@ class CrossConnectivity:
                 say(f"  {label}: {ra.label} {a.name} (serial {a.serial}) -- "
                     f"{rb.label} {b.name} (serial {b.serial}): "
                     f"{dist(xyz[i], xyz[j]):.3f} A "
-                    f"(nominal Meeko cutoff {self.threshold(i,j):.3f} A)")
+                    f"(measured Meeko cutoff {self.threshold(i,j):.3f} A)")
                 say(f"    {a.name}: {atom_origin(a, ra.originals)}; "
                     f"{b.name}: {atom_origin(b, rb.originals)}")
                 if a.name in ra.originals and b.name in rb.originals:
@@ -785,7 +824,7 @@ def main(argv=None):
     p.add_argument("--cross-restraint", type=float, default=20000.0,
                    help="One-sided separation restraint on false inter-residue bonds (kJ/mol/nm^2).")
     p.add_argument("--cross-margin", type=float, default=0.15,
-                   help="Extra distance in angstrom above Meeko's nominal inter-residue cutoff.")
+                   help="Extra distance in angstrom above Meeko's measured inter-residue cutoff.")
     p.add_argument("--no-sidechain-fallback", action="store_true",
                    help="Keep all originally observed heavy atoms fixed.")
     args = p.parse_args(argv)
@@ -807,9 +846,9 @@ def main(argv=None):
         import openmm as mm
         from openmm import app, unit
         from meeko.polymer import find_inter_mols_bonds
-        from meeko.utils.rdkitutils import covalent_radius
     except ImportError as exc:
-        say(f"ERROR: {exc}. Activate your vdock vina environment.")
+        say(f"ERROR: dependency/API import failed: {exc}")
+        say("Check the installed dependency versions; this does not necessarily mean the environment is inactive.")
         return 2
 
     _, raw = read_pdb(args.original)
@@ -829,14 +868,14 @@ def main(argv=None):
 
     topo_bonds = {pair(a.index, b.index) for a, b in pdb.topology.bonds()}
     residues = make_residues(clean, raw, topo_bonds)
-    say("=== vdock automatic local residue repair v2 (intra + inter) ===")
+    say("=== vdock automatic local residue repair v2.1 (intra + inter; Meeko version-compatible) ===")
     say(f"Original: {args.original}")
     say(f"Cleaned:  {args.clean}")
     say(f"Total atoms: {len(clean)}; residues: {len(residues)}")
     say("Atom provenance uses presence/absence of atom names in the raw PDB.")
     say("Single-residue repairs first, local residue groups if necessary. Accepted coordinates accumulate.")
     cross = CrossConnectivity(residues, clean, topo_bonds, Chem, np,
-                              find_inter_mols_bonds, covalent_radius)
+                              find_inter_mols_bonds)
 
     current, fixed, bad, unscannable = repair_sequential(
         residues, xyz, clean, pdb, topo_bonds, args, mm, app, unit,
